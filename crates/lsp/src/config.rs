@@ -42,6 +42,11 @@ pub struct FormattingConfig {
     /// If specified, all indentation will be normalized to this number of spaces.
     /// If None, indentation is left unchanged.
     pub indent_width: Option<usize>,
+
+    /// Align decimal points at this column.
+    /// When set, numbers are positioned so their decimal point appears at this column.
+    /// Mutually exclusive with currency_column (currency_column takes precedence).
+    pub decimal_column: Option<usize>,
 }
 
 impl FormattingConfig {
@@ -53,6 +58,7 @@ impl FormattingConfig {
             account_amount_spacing: 2,  // Default spacing like bean-format
             number_currency_spacing: 1, // Default 1 space between number and currency
             indent_width: None,         // Default: no indent normalization
+            decimal_column: None,       // Default: use standard right-alignment
         }
     }
 }
@@ -114,6 +120,9 @@ impl Config {
             if let Some(indent_width) = formatting.indent_width {
                 self.formatting.indent_width = Some(indent_width);
             }
+            if let Some(decimal_column) = formatting.decimal_column {
+                self.formatting.decimal_column = Some(decimal_column);
+            }
         }
 
         // Update bean-check configuration
@@ -166,6 +175,9 @@ pub struct FormattingOptions {
 
     /// Enforce consistent indentation width for postings and directives.
     pub indent_width: Option<usize>,
+
+    /// Align decimal points at this column.
+    pub decimal_column: Option<usize>,
 }
 
 #[serde_as]
@@ -236,6 +248,16 @@ mod tests {
         assert_eq!(config.account_amount_spacing, 2);
         assert_eq!(config.number_currency_spacing, 1);
         assert_eq!(config.indent_width, None);
+        assert_eq!(config.decimal_column, None);
+    }
+
+    #[test]
+    fn test_formatting_decimal_column() {
+        let mut config = Config::new(PathBuf::new());
+        config
+            .update(serde_json::from_str("{\"formatting\": {\"decimal_column\": 50}}").unwrap())
+            .unwrap();
+        assert_eq!(config.formatting.decimal_column, Some(50));
     }
 
     #[test]

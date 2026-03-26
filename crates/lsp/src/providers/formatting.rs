@@ -151,6 +151,14 @@ pub(crate) fn formatting(
                 doc,
                 snapshot.config.formatting.indent_width,
             )
+        } else if let Some(decimal_col) = snapshot.config.formatting.decimal_column {
+            generate_decimal_column_edits(
+                &formateable_lines,
+                decimal_col,
+                snapshot.config.formatting.number_currency_spacing,
+                snapshot.config.formatting.indent_width,
+                doc,
+            )
         } else {
             generate_template_edits(
                 &formateable_lines,
@@ -317,6 +325,58 @@ fn calculate_format_config(
     }
 }
 
+/// Resolves the indent string and account name for a formatable line.
+/// When indent_width is Some, applies fixed indentation (except for top-level directives).
+/// When indent_width is None, preserves original indentation.
+fn resolve_indent_and_account<'a>(
+    line: &'a FormatableLine,
+    indent_width: Option<usize>,
+    doc: &crate::document::Document,
+) -> (String, &'a str) {
+    if let Some(target_indent) = indent_width {
+        let account_part = line.prefix.trim_start().trim_end();
+
+        // Check if this is a top-level directive that shouldn't be indented
+        let line_start_char = doc.content.line_to_char(line.line_num);
+        let line_end_char = if line.line_num + 1 < doc.content.len_lines() {
+            doc.content.line_to_char(line.line_num + 1)
+        } else {
+            doc.content.len_chars()
+        };
+        let full_line = doc
+            .content
+            .slice(line_start_char..line_end_char)
+            .to_string();
+
+        let line_content = full_line.trim();
+        let is_top_level_directive = line_content.contains("balance ")
+            || line_content.contains("price ")
+            || (line_content.starts_with("20")
+                && (line_content.contains(" balance ") || line_content.contains(" price ")));
+
+        if is_top_level_directive {
+            ("".to_string(), account_part)
+        } else {
+            (" ".repeat(target_indent), account_part)
+        }
+    } else {
+        // Preserve original indentation
+        let account_part = line.prefix.trim_end();
+        let original_indent = if line.prefix.len() > account_part.len() {
+            &line.prefix[..(line.prefix.len() - account_part.len())]
+        } else {
+            ""
+        };
+        (original_indent.to_string(), account_part)
+    }
+}
+
+/// Returns the number of characters before the decimal point in a number string.
+/// For "100.00" -> 3, for "-1500.5" -> 5, for "100" (no decimal) -> 3.
+fn chars_before_decimal(number: &str) -> usize {
+    number.find('.').unwrap_or(number.len())
+}
+
 /// Generates text edits for currency column mode (bean-format -c option)
 fn generate_currency_column_edits(
     formateable_lines: &[FormatableLine],
@@ -327,43 +387,7 @@ fn generate_currency_column_edits(
     let mut text_edits = Vec::new();
 
     for line in formateable_lines {
-        // Apply custom indentation if specified, but only for postings, not top-level directives
-        let (indent_str, account_name) = if let Some(target_indent) = indent_width {
-            let account_part = line.prefix.trim_start().trim_end();
-
-            // Check if this is a top-level directive that shouldn't be indented
-            let line_start_char = doc.content.line_to_char(line.line_num);
-            let line_end_char = if line.line_num + 1 < doc.content.len_lines() {
-                doc.content.line_to_char(line.line_num + 1)
-            } else {
-                doc.content.len_chars()
-            };
-            let full_line = doc
-                .content
-                .slice(line_start_char..line_end_char)
-                .to_string();
-
-            let line_content = full_line.trim();
-            let is_top_level_directive = line_content.contains("balance ")
-                || line_content.contains("price ")
-                || (line_content.starts_with("20")
-                    && (line_content.contains(" balance ") || line_content.contains(" price ")));
-
-            if is_top_level_directive {
-                ("".to_string(), account_part)
-            } else {
-                (" ".repeat(target_indent), account_part)
-            }
-        } else {
-            // Preserve original indentation
-            let account_part = line.prefix.trim_end();
-            let original_indent = if line.prefix.len() > account_part.len() {
-                &line.prefix[..(line.prefix.len() - account_part.len())]
-            } else {
-                ""
-            };
-            (original_indent.to_string(), account_part)
-        };
+        let (indent_str, account_name) = resolve_indent_and_account(line, indent_width, doc);
 
         // Calculate spacing needed to align currency at the specified column
         // Bean-format logic: num_of_spaces = currency_column - len(prefix) - len(number) - 3
@@ -386,6 +410,60 @@ fn generate_currency_column_edits(
         );
 
         if let Some(edit) = create_line_replacement_edit(line.line_num, &target_line, doc) {
+            text_edits.push(edit);
+        }
+    }
+
+    text_edits
+}
+
+/// Generates text edits for decimal point alignment mode.
+/// Numbers are positioned so their decimal point (or end, for integers)
+/// lands at the specified column.
+fn generate_decimal_column_edits(
+    formateable_lines: &[FormatableLine],
+    decimal_col: usize,
+    number_currency_spacing: usize,
+    indent_width: Option<usize>,
+    doc: &crate::document::Document,
+) -> Vec<lsp_types::TextEdit> {
+    let mut text_edits = Vec::new();
+
+    for line in formateable_lines {
+        let (indent_str, account_name) = resolve_indent_and_account(line, indent_width, doc);
+
+        // Format currency from rest text
+        let rest_content = line.rest.trim_start();
+        let formatted_rest = if let Some(currency_start) = rest_content.find(char::is_alphabetic) {
+            format!(
+                "{}{}",
+                " ".repeat(number_currency_spacing),
+                &rest_content[currency_start..]
+            )
+        } else {
+            format!(" {rest_content}")
+        };
+
+        // Calculate spacing so decimal point lands at decimal_col (1-indexed)
+        let target_col = decimal_col.saturating_sub(1);
+        let prefix_len = indent_str.len() + account_name.len();
+        let before_decimal = chars_before_decimal(&line.number);
+        let spacing = if target_col > prefix_len + before_decimal {
+            (target_col - prefix_len - before_decimal).max(2)
+        } else {
+            2 // minimum spacing
+        };
+
+        let formatted_line = format!(
+            "{}{}{}{}{}",
+            indent_str,
+            account_name,
+            " ".repeat(spacing),
+            line.number,
+            formatted_rest,
+        );
+
+        if let Some(edit) = create_line_replacement_edit(line.line_num, &formatted_line, doc) {
             text_edits.push(edit);
         }
     }
@@ -419,47 +497,7 @@ fn generate_template_edits(
             format!(" {rest_content}")
         };
 
-        // Apply custom indentation if specified, but only for postings, not top-level directives
-        let (indent_str, account_name) = if let Some(target_indent) = indent_width {
-            let account_part = line.prefix.trim_start().trim_end();
-
-            // Check if this is a top-level directive (like balance) that shouldn't be indented
-            // Get the full line to check for directive keywords
-            let line_start_char = doc.content.line_to_char(line.line_num);
-            let line_end_char = if line.line_num + 1 < doc.content.len_lines() {
-                doc.content.line_to_char(line.line_num + 1)
-            } else {
-                doc.content.len_chars()
-            };
-            let full_line = doc
-                .content
-                .slice(line_start_char..line_end_char)
-                .to_string();
-
-            // More comprehensive check for balance/price directives
-            let line_content = full_line.trim();
-            let is_top_level_directive = line_content.contains("balance ")
-                || line_content.contains("price ")
-                || (line_content.starts_with("20")
-                    && (line_content.contains(" balance ") || line_content.contains(" price ")));
-
-            if is_top_level_directive {
-                // Don't indent top-level directives
-                ("".to_string(), account_part)
-            } else {
-                // Apply custom indentation for postings
-                (" ".repeat(target_indent), account_part)
-            }
-        } else {
-            // Preserve original indentation by finding the leading whitespace
-            let account_part = line.prefix.trim_end();
-            let original_indent = if line.prefix.len() > account_part.len() {
-                &line.prefix[..(line.prefix.len() - account_part.len())]
-            } else {
-                ""
-            };
-            (original_indent.to_string(), account_part)
-        };
+        let (indent_str, account_name) = resolve_indent_and_account(line, indent_width, doc);
 
         // Template: "{indent}{account_name:<adjusted_width}  {:>num_width}{custom_rest}"
         // Adjust the prefix width to account for the custom indentation
@@ -1019,6 +1057,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1062,6 +1101,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1108,6 +1148,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1144,6 +1185,7 @@ mod tests {
             account_amount_spacing: 3,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1179,6 +1221,7 @@ mod tests {
             account_amount_spacing: 5,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1228,6 +1271,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1282,6 +1326,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 2,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1327,6 +1372,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 0,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1363,6 +1409,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1412,6 +1459,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1479,6 +1527,7 @@ mod tests {
             account_amount_spacing: 2, // Should have at least 2 spaces
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1686,6 +1735,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1736,6 +1786,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: Some(4),
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1780,6 +1831,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: Some(2),
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1820,6 +1872,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: Some(2),
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -1975,6 +2028,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -2020,6 +2074,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: None,
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -2290,6 +2345,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: Some(2),
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -2335,6 +2391,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: Some(2),
+            decimal_column: None,
         };
 
         let state = TestState::new_with_config(content, format_config).unwrap();
@@ -2373,6 +2430,7 @@ mod tests {
             account_amount_spacing: 2,
             number_currency_spacing: 1,
             indent_width: Some(2),
+            decimal_column: None,
         };
         let state2 = TestState::new_with_config(&formatted, format_config2).unwrap();
         let edits2 = state2.format().unwrap().unwrap();
@@ -2381,5 +2439,197 @@ mod tests {
             0,
             "Second format should generate no edits (idempotent after single pass)"
         );
+    }
+
+    #[test]
+    fn test_decimal_column_basic() {
+        let content = r#"2023-01-01 * "Test transaction"
+  Assets:Cash     100.00 USD
+  Expenses:Food 50.0 USD
+  Income:Salary -1500.5 USD
+"#;
+
+        let format_config = crate::config::FormattingConfig {
+            prefix_width: None,
+            num_width: None,
+            currency_column: None,
+            account_amount_spacing: 2,
+            number_currency_spacing: 1,
+            indent_width: None,
+            decimal_column: Some(40),
+        };
+
+        let state = TestState::new_with_config(content, format_config).unwrap();
+        let edits = state.format().unwrap().unwrap();
+        let formatted = apply_edits(content, &edits);
+
+        println!("Decimal aligned at col 40:\n{formatted}");
+
+        // Verify that decimal points are all at column 40
+        let lines: Vec<&str> = formatted.lines().collect();
+        for line in &lines[1..] {
+            if let Some(dot_pos) = line.find('.') {
+                assert_eq!(
+                    dot_pos, 39,
+                    "Decimal point should be at column 40 (0-indexed 39): '{line}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_decimal_column_no_decimal_point() {
+        // Numbers without decimal points should treat end-of-number as decimal position
+        let content = r#"2023-01-01 * "Test"
+  Assets:Cash 100 USD
+  Expenses:Food 50.0 USD
+"#;
+
+        let format_config = crate::config::FormattingConfig {
+            prefix_width: None,
+            num_width: None,
+            currency_column: None,
+            account_amount_spacing: 2,
+            number_currency_spacing: 1,
+            indent_width: None,
+            decimal_column: Some(35),
+        };
+
+        let state = TestState::new_with_config(content, format_config).unwrap();
+        let edits = state.format().unwrap().unwrap();
+        let formatted = apply_edits(content, &edits);
+
+        println!("Decimal aligned with integer:\n{formatted}");
+
+        let lines: Vec<&str> = formatted.lines().collect();
+        // "100 USD" — end of "100" should be at column 35
+        let cash_line = lines.iter().find(|l| l.contains("Cash")).unwrap();
+        let num_pos = cash_line.find("100").unwrap();
+        assert_eq!(
+            num_pos + 3,
+            34,
+            "End of integer should be at decimal column 35 (0-indexed 34): '{cash_line}'"
+        );
+
+        // "50.0 USD" — decimal point should be at column 35
+        let food_line = lines.iter().find(|l| l.contains("Food")).unwrap();
+        let dot_pos = food_line.find('.').unwrap();
+        assert_eq!(
+            dot_pos, 34,
+            "Decimal point should be at column 35 (0-indexed 34): '{food_line}'"
+        );
+    }
+
+    #[test]
+    fn test_decimal_column_negative_numbers() {
+        let content = r#"2023-01-01 * "Test"
+  Assets:Cash 100.00 USD
+  Income:Salary -1500.5 USD
+"#;
+
+        let format_config = crate::config::FormattingConfig {
+            prefix_width: None,
+            num_width: None,
+            currency_column: None,
+            account_amount_spacing: 2,
+            number_currency_spacing: 1,
+            indent_width: None,
+            decimal_column: Some(40),
+        };
+
+        let state = TestState::new_with_config(content, format_config).unwrap();
+        let edits = state.format().unwrap().unwrap();
+        let formatted = apply_edits(content, &edits);
+
+        println!("Decimal aligned with negative:\n{formatted}");
+
+        // Both decimal points should be at column 40
+        let lines: Vec<&str> = formatted.lines().collect();
+        for line in &lines[1..] {
+            if let Some(dot_pos) = line.find('.') {
+                assert_eq!(
+                    dot_pos, 39,
+                    "Decimal point should be at column 40 (0-indexed 39): '{line}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_decimal_column_with_indent_width() {
+        let content = r#"2023-01-01 * "Test"
+    Assets:Cash 100.00 USD
+      Expenses:Food 50.0 USD
+"#;
+
+        let format_config = crate::config::FormattingConfig {
+            prefix_width: None,
+            num_width: None,
+            currency_column: None,
+            account_amount_spacing: 2,
+            number_currency_spacing: 1,
+            indent_width: Some(2),
+            decimal_column: Some(35),
+        };
+
+        let state = TestState::new_with_config(content, format_config).unwrap();
+        let edits = state.format().unwrap().unwrap();
+        let formatted = apply_edits(content, &edits);
+
+        println!("Decimal aligned with indent_width=2:\n{formatted}");
+
+        let lines: Vec<&str> = formatted.lines().collect();
+        for line in &lines[1..] {
+            if !line.trim().is_empty() {
+                // Check indent is 2 spaces
+                assert!(
+                    line.starts_with("  ") && !line.starts_with("   "),
+                    "Should be indented to 2 spaces: '{line}'"
+                );
+                // Check decimal alignment
+                if let Some(dot_pos) = line.find('.') {
+                    assert_eq!(
+                        dot_pos, 34,
+                        "Decimal point should be at column 35 (0-indexed 34): '{line}'"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_decimal_column_currency_column_precedence() {
+        // When both currency_column and decimal_column are set, currency_column wins
+        let content = r#"2023-01-01 * "Test"
+  Assets:Cash 100.00 USD
+  Expenses:Food 50.0 USD
+"#;
+
+        let format_config = crate::config::FormattingConfig {
+            prefix_width: None,
+            num_width: None,
+            currency_column: Some(40),
+            account_amount_spacing: 2,
+            number_currency_spacing: 1,
+            indent_width: None,
+            decimal_column: Some(30),
+        };
+
+        let state = TestState::new_with_config(content, format_config).unwrap();
+        let edits = state.format().unwrap().unwrap();
+        let formatted = apply_edits(content, &edits);
+
+        println!("Currency column wins:\n{formatted}");
+
+        // Currencies should be at column 40 (currency_column), not decimal-aligned
+        let lines: Vec<&str> = formatted.lines().collect();
+        for line in &lines[1..] {
+            if let Some(usd_pos) = line.find("USD") {
+                assert_eq!(
+                    usd_pos, 40,
+                    "Currency should be at column 40 (currency_column takes precedence): '{line}'"
+                );
+            }
+        }
     }
 }

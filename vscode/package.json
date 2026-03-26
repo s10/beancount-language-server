@@ -99,6 +99,10 @@
             "currency_column": {
               "type": "number"
             },
+            "decimal_column": {
+              "type": "number",
+              "description": "Align decimal points at this column."
+            },
             "account_amount_spacing": {
               "type": "number"
             },

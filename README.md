@@ -418,6 +418,7 @@ This completely disables warnings for flagged transactions.
 | `currency_column`         | number | Align currencies at this specific column                    | None (right-align) | `--currency-column` (`-c`) |
 | `account_amount_spacing`  | number | Minimum spaces between account names and amounts            | 2                  | N/A                        |
 | `number_currency_spacing` | number | Number of spaces between number and currency                | 1                  | N/A                        |
+| `decimal_column`          | number | Align decimal points at this specific column                | None (right-align) | N/A                        |
 
 #### Formatting Modes
 
@@ -432,6 +433,13 @@ This completely disables warnings for flagged transactions.
 - Currencies are aligned at the specified column
 - Numbers are positioned to place currencies at the target column
 - Equivalent to `bean-format --currency-column N`
+
+**Decimal Point Alignment Mode** (`decimal_column` specified):
+
+- Numbers are positioned so their decimal point falls at the specified column
+- Numbers without a decimal point are treated as if the decimal is at the end
+- Currencies follow the number (not column-aligned)
+- Similar to the beancount VSCode extension's `separatorColumn` behavior
 
 #### Examples
 
@@ -459,6 +467,16 @@ This completely disables warnings for flagged transactions.
 {
   "formatting": {
     "currency_column": 60
+  }
+}
+```
+
+**Decimal point alignment:**
+
+```json
+{
+  "formatting": {
+    "decimal_column": 50
   }
 }
 ```
